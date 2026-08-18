@@ -284,7 +284,7 @@ function normPhone(p){ return (p||'').replace(/\s|-/g,''); }
 
 const SETTINGS_DEFAULTS = {
   title:'Card Claim Sale', businessName:'', contactInfo:'', bankName:'', accountNumber:'', accountHolder:'',
-  branchCode:'', refPrefix:'', paymentTerms:'', sheetsUrl:''
+  branchCode:'', refPrefix:'', paymentTerms:'', sheetsUrl:'', shippingLabel:'', shippingFee:''
 };
 function cfg(){ return {...SETTINGS_DEFAULTS, ...(state.saleConfig||{})}; }
 async function saveSettings(fields){
@@ -293,7 +293,7 @@ async function saveSettings(fields){
     title: fields.title, business_name: fields.businessName, contact_info: fields.contactInfo,
     bank_name: fields.bankName, account_holder: fields.accountHolder, account_number: fields.accountNumber,
     branch_code: fields.branchCode, ref_prefix: fields.refPrefix, payment_terms: fields.paymentTerms,
-    sheets_url: fields.sheetsUrl,
+    sheets_url: fields.sheetsUrl, shipping_label: fields.shippingLabel, shipping_fee: fields.shippingFee,
   };
   if(fields.newPin) payload.new_pin = fields.newPin;
   const { error } = await sb.rpc('admin_action', {p_sale_id:state.saleId, p_pin:state.sellerPin, p_action:'update_settings', p_payload:payload});
@@ -578,60 +578,166 @@ function generateInvoicePdf(buyer){
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({unit:'pt', format:'a4'});
   const c = cfg();
-  const marginX = 48; let y = 56;
-  doc.setFont('helvetica','bold'); doc.setFontSize(18);
-  doc.text(c.businessName || state.saleConfig?.title || 'Card Claim Sale', marginX, y); y+=20;
-  doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(90);
-  if(c.contactInfo){ doc.text(c.contactInfo, marginX, y); y+=14; }
-  y+=10;
-  doc.setDrawColor(220); doc.line(marginX, y, 547, y); y+=24;
+  const PAGE_W = 595.28, marginX = 48, rightX = 547;
+  const BLUE=[23,98,224], GOLD=[243,181,63], ZEBRA=[234,242,254], GRAYBOX=[245,247,250],
+        TEXT=[26,26,26], GRAY=[138,148,166], GREEN=[34,150,110], RED=[214,58,78];
 
-  doc.setTextColor(20); doc.setFont('helvetica','bold'); doc.setFontSize(11);
-  doc.text('Billed to', marginX, y);
-  doc.text('Invoice date', 380, y); y+=16;
-  doc.setFont('helvetica','normal'); doc.setFontSize(11);
-  doc.text(buyer.firstName+' '+buyer.lastName, marginX, y);
-  doc.text(new Date().toLocaleDateString('en-ZA'), 380, y); y+=14;
-  doc.setTextColor(120); doc.setFontSize(10);
-  doc.text(buyer.phone, marginX, y); y+=28;
+  const claimedDate = buyer.cards[0]?.claimedAt ? new Date(buyer.cards[0].claimedAt) : new Date();
+  const dateForNo = isNaN(claimedDate.getTime()) ? new Date() : claimedDate;
+  const invNo = (c.refPrefix||'INV') + normPhone(buyer.phone).slice(-4);
+  const saleRef = c.refPrefix ? (c.refPrefix + '-' + dateForNo.getFullYear()) : '';
+  const dateStr = new Date().toLocaleDateString('en-ZA', {day:'2-digit', month:'long', year:'numeric'});
+  const shippingFee = parseFloat(c.shippingFee);
+  const hasShipping = !isNaN(shippingFee) && shippingFee > 0;
+  const grandTotal = buyer.total + (hasShipping ? shippingFee : 0);
+  const grandOwing = buyer.owing + (hasShipping ? shippingFee : 0);
 
-  doc.setTextColor(20); doc.setFont('helvetica','bold'); doc.setFontSize(10);
-  doc.text('Card', marginX, y); doc.text('Price', 460, y, {align:'right'}); doc.text('Status', 520, y, {align:'right'});
-  y+=8; doc.setDrawColor(220); doc.line(marginX, y, 547, y); y+=16;
-  doc.setFont('helvetica','normal');
-  buyer.cards.forEach(card=>{
-    doc.text(card.name + (card.set?'  #'+card.set:''), marginX, y);
-    doc.text(fmt(card.price), 460, y, {align:'right'});
-    doc.setTextColor(...(card.paid?[47,160,120]:[220,60,80]));
-    doc.text(card.paid?'Paid':'Unpaid', 520, y, {align:'right'});
-    doc.setTextColor(20);
-    y+=18;
-  });
-  y+=6; doc.setDrawColor(220); doc.line(marginX, y, 547, y); y+=22;
-
-  doc.setFont('helvetica','bold'); doc.setFontSize(12);
-  doc.text('Total', 400, y); doc.text(fmt(buyer.total), 547, y, {align:'right'}); y+=18;
-  doc.setTextColor(...(buyer.owing>0?[220,60,80]:[47,160,120]));
-  doc.text('Balance due', 400, y); doc.text(fmt(buyer.owing), 547, y, {align:'right'}); y+=32;
-  doc.setTextColor(20);
-
-  if(c.bankName || c.accountNumber){
-    doc.setFont('helvetica','bold'); doc.setFontSize(10.5); doc.text('Payment details', marginX, y); y+=16;
-    doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(80);
-    const lines = [];
-    if(c.bankName) lines.push('Bank: '+c.bankName);
-    if(c.accountHolder) lines.push('Account holder: '+c.accountHolder);
-    if(c.accountNumber) lines.push('Account number: '+c.accountNumber);
-    if(c.branchCode) lines.push('Branch code: '+c.branchCode);
-    const ref = (c.refPrefix||'REF') + '-' + normPhone(buyer.phone).slice(-4);
-    lines.push('Reference: '+ref);
-    lines.forEach(l=>{ doc.text(l, marginX, y); y+=14; });
-    y+=8;
+  function truncateToWidth(text, maxW, size){
+    doc.setFontSize(size);
+    if(doc.getTextWidth(text) <= maxW) return text;
+    let t = text;
+    while(t.length>1 && doc.getTextWidth(t+'\u2026') > maxW){ t = t.slice(0,-1); }
+    return t+'\u2026';
   }
+
+  // ---- header band ----
+  doc.setFillColor(...BLUE); doc.rect(0, 0, PAGE_W, 96, 'F');
+  doc.setFillColor(...GOLD); doc.rect(0, 96, PAGE_W, 5, 'F');
+  doc.setTextColor(255,255,255); doc.setFont('helvetica','bold'); doc.setFontSize(19);
+  doc.text(truncateToWidth(c.businessName || state.saleConfig?.title || 'Card Claim Sale', 260, 19), marginX, 42);
+  doc.setTextColor(...GOLD); doc.setFontSize(24);
+  doc.text('INVOICE', rightX, 42, {align:'right'});
+  doc.setTextColor(255,255,255); doc.setFont('helvetica','normal'); doc.setFontSize(9.5);
+  const tagBits = [c.contactInfo, state.saleConfig?.title].filter(Boolean);
+  if(tagBits.length) doc.text(truncateToWidth(tagBits.join('   \u00b7   '), 499, 9.5), rightX, 66, {align:'right'});
+
+  let y = 138;
+
+  // ---- bill to (left) + invoice info box (right) ----
+  doc.setTextColor(...GRAY); doc.setFont('helvetica','bold'); doc.setFontSize(8.5);
+  doc.text('BILL TO', marginX, y);
+  doc.setTextColor(...TEXT); doc.setFont('helvetica','bold'); doc.setFontSize(13);
+  doc.text(buyer.firstName+' '+buyer.lastName, marginX, y+18);
+  doc.setTextColor(...GRAY); doc.setFont('helvetica','normal'); doc.setFontSize(10);
+  doc.text(buyer.phone, marginX, y+34);
+
+  const boxW = 200, boxX = rightX-boxW;
+  const boxRows = [['INVOICE NO', invNo], ['DATE', dateStr]];
+  if(saleRef) boxRows.push(['SALE REF', saleRef]);
+  const boxH = 16 + boxRows.length*20;
+  doc.setFillColor(...GRAYBOX); doc.roundedRect(boxX, y-14, boxW, boxH, 6, 6, 'F');
+  let by = y+2;
+  boxRows.forEach(([label,val])=>{
+    doc.setTextColor(...GRAY); doc.setFont('helvetica','bold'); doc.setFontSize(8);
+    doc.text(label, boxX+14, by);
+    doc.setTextColor(...TEXT); doc.setFont('helvetica','bold'); doc.setFontSize(10);
+    doc.text(String(val), boxX+boxW-14, by, {align:'right'});
+    by += 20;
+  });
+
+  y += (saleRef ? 82 : 62);
+
+  // ---- table ----
+  const colNum=marginX+8, colDesc=marginX+34, colQty=400, colPrice=470, colTotal=rightX;
+  doc.setFillColor(...BLUE); doc.rect(marginX, y, rightX-marginX, 24, 'F');
+  doc.setTextColor(255,255,255); doc.setFont('helvetica','bold'); doc.setFontSize(9);
+  doc.text('#', colNum, y+16);
+  doc.text('CARD / ITEM', colDesc, y+16);
+  doc.text('QTY', colQty, y+16, {align:'right'});
+  doc.text('UNIT PRICE', colPrice, y+16, {align:'right'});
+  doc.text('LINE TOTAL', colTotal, y+16, {align:'right'});
+  y += 24;
+
+  // rows are single-height (no PAID/UNPAID stamp), matching the reference invoice
+  const rowH = 26;
+  doc.setFont('helvetica','normal'); doc.setFontSize(10);
+  buyer.cards.forEach((card,i)=>{
+    if(y > 770){ doc.addPage(); y = 56; }
+    if(i%2===0){ doc.setFillColor(...ZEBRA); doc.rect(marginX, y, rightX-marginX, rowH, 'F'); }
+    doc.setTextColor(...GRAY); doc.setFontSize(9);
+    doc.text(String(i+1), colNum, y+16);
+    doc.setTextColor(...TEXT); doc.setFontSize(10);
+    const name = card.name + (card.set?'  #'+card.set:'');
+    doc.text(truncateToWidth(name, colQty-colDesc-30, 10), colDesc, y+16);
+    doc.text('1', colQty, y+16, {align:'right'});
+    doc.text(fmt(card.price), colPrice, y+16, {align:'right'});
+    doc.setFont('helvetica','bold');
+    doc.text(fmt(card.price), colTotal, y+16, {align:'right'});
+    doc.setFont('helvetica','normal');
+    y += rowH;
+  });
+  doc.setDrawColor(220,224,232); doc.line(marginX, y, rightX, y); y += 22;
+
+  // ---- totals ----
+  if(y > 760){ doc.addPage(); y = 56; }
+  doc.setTextColor(...GRAY); doc.setFont('helvetica','normal'); doc.setFontSize(10);
+  doc.text('Subtotal', 420, y);
+  doc.setTextColor(...TEXT); doc.text(fmt(buyer.total), rightX, y, {align:'right'}); y += 22;
+  if(hasShipping){
+    doc.setTextColor(...GRAY);
+    doc.text('Shipping'+(c.shippingLabel?' ('+c.shippingLabel+')':''), 420, y);
+    doc.setTextColor(...TEXT); doc.text(fmt(shippingFee), rightX, y, {align:'right'}); y += 22;
+  }
+  doc.setTextColor(...TEXT); doc.setFont('helvetica','bold'); doc.setFontSize(12);
+  doc.text('TOTAL DUE', 450, y, {align:'right'});
+  doc.setTextColor(...(grandOwing>0?RED:GREEN));
+  doc.text(fmt(grandTotal), rightX, y, {align:'right'});
+  y += 40;
+
+  // ---- banking details (2-column grid, matches reference) ----
+  if(c.bankName || c.accountNumber){
+    const rows = [];
+    if(c.bankName) rows.push(['Bank', c.bankName]);
+    if(c.accountNumber) rows.push(['Account No', c.accountNumber]);
+    if(c.branchCode) rows.push(['Branch Code', c.branchCode]);
+    if(c.accountHolder) rows.push(['Account Holder', c.accountHolder]);
+    rows.push(['Reference', invNo]);
+    const neededH = 26 + Math.ceil(rows.length/2)*34;
+    if(y + neededH > 800){ doc.addPage(); y = 56; }
+
+    doc.setFillColor(...GOLD); doc.rect(marginX, y, 3, 13, 'F');
+    doc.setTextColor(...TEXT); doc.setFont('helvetica','bold'); doc.setFontSize(11);
+    doc.text('Banking details', marginX+10, y+10); y += 26;
+
+    const colW = (rightX-marginX)/2;
+    for(let i=0;i<rows.length;i+=2){
+      const pair = [rows[i], rows[i+1]].filter(Boolean);
+      pair.forEach(([label,val], j)=>{
+        const cx = marginX + j*colW;
+        doc.setTextColor(...GRAY); doc.setFont('helvetica','bold'); doc.setFontSize(8);
+        doc.text(label.toUpperCase(), cx, y);
+        doc.setTextColor(...TEXT); doc.setFont('helvetica','bold'); doc.setFontSize(11);
+        doc.text(String(val), cx, y+15);
+      });
+      y += 34;
+    }
+    y += 6;
+  }
+
+  // ---- payment terms ----
   if(c.paymentTerms){
-    doc.setTextColor(120); doc.setFontSize(9);
-    const wrapped = doc.splitTextToSize(c.paymentTerms, 500);
+    doc.setFontSize(9.5);
+    const wrapped = doc.splitTextToSize(c.paymentTerms, rightX-marginX);
+    const neededH = 22 + wrapped.length*13 + 14;
+    if(y + neededH > 800){ doc.addPage(); y = 56; }
+
+    doc.setFillColor(...GOLD); doc.rect(marginX, y, 3, 13, 'F');
+    doc.setTextColor(...TEXT); doc.setFont('helvetica','bold'); doc.setFontSize(11);
+    doc.text('Payment terms', marginX+10, y+10); y += 22;
+    doc.setTextColor(...GRAY); doc.setFont('helvetica','normal'); doc.setFontSize(9.5);
     doc.text(wrapped, marginX, y);
+    y += wrapped.length*13 + 14;
+  }
+
+  // ---- footer ----
+  if(y + 40 > 800){ doc.addPage(); y = 56; }
+  doc.setDrawColor(230,233,238); doc.line(marginX, y, rightX, y); y += 18;
+  doc.setTextColor(...GRAY); doc.setFont('helvetica','normal'); doc.setFontSize(8.5);
+  doc.text('Thank you for your purchase!  \u00b7  Generated '+dateStr, marginX, y);
+  y += 16;
+  if(c.businessName){
+    doc.setTextColor(...TEXT); doc.setFont('helvetica','bold'); doc.setFontSize(10);
+    doc.text(c.businessName.toUpperCase(), marginX, y);
   }
 
   doc.save('invoice-'+(buyer.firstName+'-'+buyer.lastName).toLowerCase().replace(/\s+/g,'-')+'.pdf');
@@ -651,6 +757,7 @@ async function loadSaleConfig(){
         bankName:data.bank_name, accountHolder:data.account_holder, accountNumber:data.account_number,
         branchCode:data.branch_code, refPrefix:data.ref_prefix, paymentTerms:data.payment_terms,
         sheetsUrl:data.sheets_url,
+        shippingLabel: data.shipping_label || '', shippingFee: (data.shipping_fee==null? '' : data.shipping_fee),
         revealActive: !!data.reveal_active,
         revealStartedAt: newStartedAt,
         revealSeconds: data.reveal_seconds || 15,
@@ -1602,6 +1709,11 @@ function renderSettingsTab(){
         <div class="field"><label class="label">Reference prefix</label><input class="input" placeholder="e.g. SALE" value="${esc(f.refPrefix)}" oninput="setPath('settingsForm.refPrefix',this.value)"></div>
       </div>
       <div class="field"><label class="label">Payment terms note</label><input class="input" placeholder="e.g. Payment due within 3 days of claim" value="${esc(f.paymentTerms)}" oninput="setPath('settingsForm.paymentTerms',this.value)"></div>
+      <div class="form-grid">
+        <div class="field"><label class="label">Shipping label (optional)</label><input class="input" placeholder="e.g. Pudo" value="${esc(f.shippingLabel)}" oninput="setPath('settingsForm.shippingLabel',this.value)"></div>
+        <div class="field"><label class="label">Shipping fee (R, optional)</label><input class="input" type="number" min="0" step="0.01" placeholder="0.00" value="${esc(f.shippingFee)}" oninput="setPath('settingsForm.shippingFee',this.value)"></div>
+      </div>
+      <p style="color:var(--dimmer);font-size:10.5px;margin:-4px 2px 12px;">When set, this is added as a "Shipping" line on every invoice, before the total.</p>
       <button class="btn btn-mint btn-sm" data-action="save-invoice-settings">${state.settingsSaved?'\u2713 Saved':'Save details'}</button>
     </div>
 
@@ -1653,6 +1765,11 @@ function renderInvoiceModal(){
   const buyers = getBuyers();
   const b = buyers.find(x=>normPhone(x.phone)===state.invoiceBuyerPhone);
   if(!b) return '';
+  const c = cfg();
+  const shippingFee = parseFloat(c.shippingFee);
+  const hasShipping = !isNaN(shippingFee) && shippingFee > 0;
+  const grandTotal = b.total + (hasShipping?shippingFee:0);
+  const grandOwing = b.owing + (hasShipping?shippingFee:0);
   const claimedDate = b.cards[0]?.claimedAt ? new Date(b.cards[0].claimedAt) : new Date();
   const dateStr = isNaN(claimedDate.getTime()) ? new Date().toISOString().slice(0,10) : claimedDate.toISOString().slice(0,10);
   const invNo = 'INV-' + state.invoiceBuyerPhone.slice(-4) + '-' + dateStr.replace(/-/g,'');
@@ -1685,14 +1802,20 @@ function renderInvoiceModal(){
               <span class="fm">${fmt(c.price)} ${c.paid?'<span style="color:var(--mint2);font-size:11px;">paid</span>':'<span style="color:var(--red);font-size:11px;">unpaid</span>'}</span>
             </div>
           `).join('')}
+          ${hasShipping?`
+            <div class="invoice-line">
+              <span>Shipping${cfg().shippingLabel?' ('+esc(cfg().shippingLabel)+')':''}</span>
+              <span class="fm">${fmt(shippingFee)}</span>
+            </div>
+          `:''}
         </div>
         <div class="row-between" style="margin-bottom:6px;">
           <span style="color:var(--dim);font-size:13px;">Total</span>
-          <span class="fm" style="font-weight:700;font-size:16px;">${fmt(b.total)}</span>
+          <span class="fm" style="font-weight:700;font-size:16px;">${fmt(grandTotal)}</span>
         </div>
         <div class="row-between">
           <span style="color:var(--dim);font-size:13px;">Balance due</span>
-          <span class="fm" style="font-weight:700;font-size:16px;color:${b.owing>0?'var(--red)':'var(--mint2)'};">${fmt(b.owing)}</span>
+          <span class="fm" style="font-weight:700;font-size:16px;color:${grandOwing>0?'var(--red)':'var(--mint2)'};">${fmt(grandOwing)}</span>
         </div>
         ${(cfg().bankName||cfg().accountNumber)?`
         <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);">
@@ -2119,7 +2242,5 @@ async function copyInvoiceSummary(phone){
   }
 })();
 </script>
-</body>
-</html>
 </body>
 </html>
