@@ -115,6 +115,7 @@
   .chat-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:52;}
   .chat-panel{position:fixed;left:0;top:0;bottom:0;right:0;background:var(--panel);border-right:1px solid var(--border);z-index:53;display:flex;flex-direction:column;box-shadow:8px 0 30px rgba(0,0,0,.4);animation:slideInLeft .18s ease-out;}
   @media(min-width:600px){.chat-panel{right:auto;width:340px;}}
+  @media(min-width:600px){body.chat-open .wrap, body.chat-open .center-screen{padding-left:340px;transition:padding-left .18s ease-out;}}
   @keyframes slideInLeft{from{transform:translateX(-100%);}to{transform:translateX(0);}}
   .chat-panel-head{display:flex;justify-content:space-between;align-items:flex-start;padding:14px 14px 10px;border-bottom:1px solid var(--border);}
   .chat-scroll{flex:1;overflow-y:auto;padding:10px 14px;}
@@ -200,8 +201,9 @@ let state = {
   loadingFromSheet:false,
   serverOffsetMs:0, revealTickHandle:null, revealSecondsInput:'15', revealStarting:false, revealError:'',
   showFullCatalogDuringReveal:false,
-  chatOpen:false, chatMessages:[], chatInput:'', chatSending:false, chatError:'', chatChannel:null, chatLoaded:false, chatSetupError:false,
+  chatOpen:true, chatMessages:[], chatInput:'', chatSending:false, chatError:'', chatChannel:null, chatLoaded:false, chatSetupError:false,
   cartOpen:false, showOrderSummary:false,
+  csvImporting:false, csvImportMsg:'', csvImportError:'',
 };
 
 function myCartCards(){
@@ -570,6 +572,74 @@ function exportBuyersCSV(){
     rows.push([b.firstName+' '+b.lastName, b.phone, b.cards.map(c=>c.name).join('; '), b.total, b.paidTotal, b.owing]);
   });
   downloadCSV('buyers.csv', rows);
+}
+
+/* ---------- CSV import (bulk add cards) ---------- */
+function parseCSV(text){
+  // Minimal RFC4180-ish CSV parser: handles quoted fields, escaped quotes, commas/newlines inside quotes.
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i=0;i<text.length;i++){
+    const c = text[i], next = text[i+1];
+    if(inQuotes){
+      if(c==='"' && next==='"'){ field+='"'; i++; }
+      else if(c==='"'){ inQuotes=false; }
+      else field += c;
+    } else {
+      if(c==='"') inQuotes = true;
+      else if(c===','){ row.push(field); field=''; }
+      else if(c==='\r'){ /* skip */ }
+      else if(c==='\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else field += c;
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(f=>f.trim()!==''));
+}
+function csvHeaderIndex(headerRow, candidates){
+  const lower = headerRow.map(h=>h.trim().toLowerCase());
+  for(const cand of candidates){
+    const idx = lower.indexOf(cand);
+    if(idx>-1) return idx;
+  }
+  return -1;
+}
+async function importCardsFromCSVFile(file){
+  if(!file || !sb || !state.saleId || !state.sellerPin) return;
+  state.csvImporting = true; state.csvImportMsg=''; state.csvImportError=''; render();
+  try{
+    const text = await file.text();
+    const rows = parseCSV(text);
+    if(rows.length < 2){ throw new Error('That file doesn\u2019t look like it has any data rows.'); }
+    const header = rows[0];
+    const nameIdx = csvHeaderIndex(header, ['name','card','card name']);
+    const setIdx = csvHeaderIndex(header, ['card number','set','number','#']);
+    const costIdx = csvHeaderIndex(header, ['cost','cost price','your cost']);
+    const priceIdx = csvHeaderIndex(header, ['price','sale price']);
+    if(nameIdx===-1 || priceIdx===-1){
+      throw new Error('Couldn\u2019t find "Name" and "Price" columns. Expected headers like: Name, Card Number, Cost, Price.');
+    }
+    let added = 0, skipped = 0;
+    for(let i=1;i<rows.length;i++){
+      const r = rows[i];
+      const name = (r[nameIdx]||'').trim();
+      const priceRaw = (r[priceIdx]||'').trim();
+      const price = parseFloat(priceRaw.replace(/[^0-9.\-]/g,''));
+      if(!name || isNaN(price)){ skipped++; continue; }
+      const set = setIdx>-1 ? (r[setIdx]||'').trim() : '';
+      const costRaw = costIdx>-1 ? (r[costIdx]||'').trim() : '';
+      const cost = costRaw==='' ? null : parseFloat(costRaw.replace(/[^0-9.\-]/g,''));
+      const payload = { name, card_number:set, price, cost_price:(cost==null||isNaN(cost))?null:cost, image_url:'' };
+      const { error } = await sb.rpc('admin_action', {p_sale_id:state.saleId, p_pin:state.sellerPin, p_action:'upsert_card', p_payload:payload});
+      if(error) skipped++; else added++;
+    }
+    state.csvImportMsg = `Imported ${added} card${added===1?'':'s'}${skipped?`, skipped ${skipped} row${skipped===1?'':'s'}`:''}. Add photos to each card from the Catalog tab.`;
+    await loadCards(true);
+    syncToSheetIfConfigured();
+  }catch(e){
+    state.csvImportError = e.message || 'Could not import that file.';
+  }
+  state.csvImporting = false; render();
 }
 
 /* ---------- PDF invoice ---------- */
@@ -1195,6 +1265,7 @@ ICON.tag='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="cu
 ICON.gear='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>';
 ICON.sheet='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/></svg>';
 ICON.download='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>';
+ICON.upload='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>';
 ICON.chat='<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z"/></svg>';
 ICON.send='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>';
 
@@ -1283,14 +1354,13 @@ function renderCartPanel(cart){
 function renderChatPanel(isSeller, count){
   const msgs = state.chatMessages;
   return `
-  <div class="chat-overlay" data-action="toggle-chat"></div>
   <div class="chat-panel">
     <div class="chat-panel-head">
       <div>
         <p style="font-weight:700;font-size:13.5px;margin:0;">${ICON.chat} Group chat</p>
         <p style="color:var(--dimmer);font-size:11px;margin:2px 0 0;">${count} message${count===1?'':'s'} &middot; visible to everyone in this sale</p>
       </div>
-      <button class="icon-btn" data-action="toggle-chat">${ICON.x}</button>
+      <button class="icon-btn" data-action="toggle-chat" title="Minimize">${ICON.x}</button>
     </div>
     ${state.chatSetupError?`
     <div style="margin:14px;padding:12px;background:rgba(220,60,80,.1);border:1px solid rgba(220,60,80,.3);border-radius:10px;">
@@ -1505,7 +1575,14 @@ function renderCatalogTab(avail){
       `}
     </div>
 
-    <button class="btn btn-primary btn-block" style="margin-bottom:16px;" data-action="${state.showAddForm?'close-form':'open-add-form'}">${ICON.plus} ${state.showAddForm?'Cancel':'Add a card'}</button>
+    <div class="row gap-2" style="margin-bottom:16px;">
+      <button class="btn btn-primary" style="flex:1;" data-action="${state.showAddForm?'close-form':'open-add-form'}">${ICON.plus} ${state.showAddForm?'Cancel':'Add a card'}</button>
+      <button class="btn btn-ghost" style="flex:1;" ${state.csvImporting?'disabled':''} data-action="trigger-csv-import">${ICON.upload} ${state.csvImporting?'Importing\u2026':'Import CSV'}</button>
+      <input id="csvFileInput" type="file" accept=".csv,text/csv" style="display:none;" onchange="importCardsFromCSVFile(this.files[0]); this.value='';">
+    </div>
+    ${state.csvImportMsg?`<p style="color:var(--mint2);font-size:12px;margin:-8px 0 14px;">${esc(state.csvImportMsg)}</p>`:''}
+    ${state.csvImportError?`<p class="err" style="margin:-8px 0 14px;">${esc(state.csvImportError)}</p>`:''}
+    <p style="color:var(--dimmer);font-size:11px;margin:-10px 0 16px;line-height:1.5;">CSV columns: <b style="color:var(--dim);">Name, Card Number, Cost, Price</b> (a header row is required; Cost and Card Number are optional). Add photos to each card afterwards from this tab.</p>
 
     <div id="addFormAnchor"></div>
     ${state.showAddForm?renderCardForm():''}
@@ -1983,8 +2060,8 @@ function renderRevealView(rs){
     <div class="center-screen" style="min-height:calc(100vh - 96px);padding-top:0;">
       <div class="max-sm" style="text-align:center;">
         <p class="fm" style="color:var(--dimmer);font-size:12px;margin:0 0 14px;letter-spacing:.04em;">CARD ${rs.index+1} OF ${rs.total}</p>
-        <div class="thumb" style="border-radius:16px;max-width:260px;margin:0 auto 18px;${c.imageUrl?'cursor:zoom-in;':''}" ${c.imageUrl?`data-action="open-lightbox" data-img="${esc(c.imageUrl)}"`:''}>
-          ${c.imageUrl?`<img src="${esc(c.imageUrl)}" alt="">`:ICON.imgOff}
+        <div style="width:100%;max-width:280px;height:340px;margin:0 auto 18px;border-radius:16px;background:var(--panel2);display:flex;align-items:center;justify-content:center;overflow:hidden;${c.imageUrl?'cursor:zoom-in;':''}" ${c.imageUrl?`data-action="open-lightbox" data-img="${esc(c.imageUrl)}"`:''}>
+          ${c.imageUrl?`<img src="${esc(c.imageUrl)}" alt="" style="max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;">`:ICON.imgOff}
         </div>
         <h2 class="fh" style="font-size:19px;font-weight:700;margin:0 0 4px;">${esc(c.name)}</h2>
         ${c.set?`<p class="card-set fm" style="font-size:11px;">#${esc(c.set)}</p>`:''}
@@ -2188,6 +2265,7 @@ document.addEventListener('click', function(e){
     }
     case 'export-catalog-csv': exportCatalogCSV(); break;
     case 'export-buyers-csv': exportBuyersCSV(); break;
+    case 'trigger-csv-import': document.getElementById('csvFileInput')?.click(); break;
     case 'test-sheets-connection': testSheetsConnection(); break;
     case 'load-cards-from-sheet': loadCardsFromSheet(); break;
     case 'manual-sync-now': manualSyncNow(); break;
